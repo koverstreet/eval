@@ -1,6 +1,7 @@
 #![feature(dynamic_lib)]
 
 use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::process::Command;
 
@@ -11,36 +12,54 @@ use std::mem::transmute;
 extern crate tempdir;
 use tempdir::TempDir;
 
-pub fn eval_typename<T>(src: &str, ret_type: &str) -> Option<T> {
-    let tempdir = TempDir::new("rust-eval").expect("tmpdir failure");
+impl From<io::Error> for EvalError {
+    fn from(_: io::Error) -> EvalError {
+        EvalError::InternalError
+    }
+}
+
+impl From<String> for EvalError {
+    fn from(_: String) -> EvalError {
+        EvalError::InternalError
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum EvalError {
+    CompileError,
+    InternalError,
+}
+
+pub fn eval_typename<T>(src: &str, ret_type: &str) -> Result<T, EvalError> {
+    let tempdir = try!(TempDir::new("rust-eval"));
     let srcpath = tempdir.path().join("eval.rs");
 
-    let mut srcfile = File::create(&srcpath).expect("error creating src file");
-    srcfile.write(b"#[no_mangle]\n").ok().unwrap();
-    srcfile.write(b"pub fn eval_fn() -> ").ok().unwrap();
-    srcfile.write(ret_type.as_bytes()).ok().unwrap();
-    srcfile.write(b" { ").ok().unwrap();
-    srcfile.write(src.as_bytes()).ok().unwrap();
-    srcfile.write(b" } ").ok().unwrap();
+    let mut srcfile = try!(File::create(&srcpath));
 
-    if !Command::new("rustc")
-        .arg("-C").arg("prefer-dynamic")
-        .arg("--crate-type").arg("dylib")
-        .arg("--out-dir").arg(tempdir.path())
-        .arg(srcpath)
-        .status()
-        .expect("error execcing rustc")
-        .success() {
-        return None;
+    try!(srcfile.write(b"#[no_mangle]\n"));
+    try!(srcfile.write(b"pub fn eval_fn() -> "));
+    try!(srcfile.write(ret_type.as_bytes()));
+    try!(srcfile.write(b" { "));
+    try!(srcfile.write(src.as_bytes()));
+    try!(srcfile.write(b" } "));
+    drop(srcfile);
+
+    if !try!(Command::new("rustc")
+                .arg("-C").arg("prefer-dynamic")
+                .arg("--crate-type").arg("dylib")
+                .arg("--out-dir").arg(tempdir.path())
+                .arg(srcpath)
+                .status()).success() {
+        return Err(EvalError::CompileError);
     }
 
     let libpath = tempdir.path().join("libeval.so");
-    let lib = DynamicLibrary::open(Some(libpath.as_path())).expect("error opening eval lib");
+    let lib = try!(DynamicLibrary::open(Some(libpath.as_path())));
     unsafe {
-        let eval_fn : fn() -> T =
-            transmute(lib.symbol::<isize>("eval_fn").expect("error looking up symbol"));
+        let eval_sym = try!(lib.symbol::<isize>("eval_fn"));
+        let eval_fn : fn() -> T = transmute(eval_sym);
 
-        Some(eval_fn())
+        Ok(eval_fn())
     }
 }
 
@@ -50,6 +69,6 @@ macro_rules! eval {
 
 #[test]
 fn test_eval() {
-    assert_eq!(eval!(u32, "0u32"), Some(0));
-    assert_eq!(eval!(u32, "let mut x = 0; for i in 0..10 { x += i; } x"), Some(45));
+    assert_eq!(eval!(u32, "0u32"), Ok(0));
+    assert_eq!(eval!(u32, "let mut x = 0; for i in 0..10 { x += i; } x"), Ok(45));
 }
