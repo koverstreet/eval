@@ -1,4 +1,7 @@
+#![feature(core)]
 #![feature(dynamic_lib)]
+#![feature(unboxed_closures)]
+#![feature(log_syntax)]
 
 use std::fs::File;
 use std::io;
@@ -65,6 +68,7 @@ pub unsafe fn __compile_fn(fn_type: &str, src: &str)
 
 macro_rules! compile_fn_str {
     (($($A:ident : $T:ty),*) -> $R:ty, $src:expr) => { unsafe {
+        use std::mem::transmute;
         struct CompiledFn {
             /* need the DynamicLibrary handle to live as long as the fn pointer.. */
             #[allow(dead_code, deprecated)]
@@ -72,7 +76,29 @@ macro_rules! compile_fn_str {
             func: fn($($A: $T),*) -> $R,
         }
 
-        use std::mem::transmute;
+        impl Fn<($($T,)*)> for CompiledFn {
+            #[inline]
+            extern "rust-call" fn call(&self, ($($A,)*): ($($T,)*)) -> $R {
+                (self.func)($($A),*)
+            }
+        }
+
+        impl FnMut<($($T,)*)> for CompiledFn {
+            #[inline]
+            extern "rust-call" fn call_mut(&mut self, ($($A,)*): ($($T,)*)) -> $R {
+                (self.func)($($A),*)
+            }
+        }
+
+        impl FnOnce<($($T,)*)> for CompiledFn {
+            type Output = $R;
+
+            #[inline]
+            extern "rust-call" fn call_once(self, ($($A,)*): ($($T,)*)) -> $R {
+                (self.func)($($A),*)
+            }
+        }
+
         __compile_fn(stringify!(($($A: $T),*) -> $R), $src)
             .map(|x| { let (l, f) = x; CompiledFn { lib: l, func: transmute(f)} } )
     } };
@@ -94,7 +120,7 @@ macro_rules! compile_fn {
 
 macro_rules! eval_str {
     ($R:ty, $src:expr) => {
-        compile_fn_str!(() -> $R, $src).map(|f| (f.func)())
+        compile_fn_str!(() -> $R, $src).map(|f| f())
     };
 }
 
@@ -113,25 +139,25 @@ fn test_eval() {
     let no_ret_no_args = compile_fn!((), {
                                let mut x = 0; for i in 0..10 { x += i; }
                            }).expect("compile error");
-    (no_ret_no_args.func)();
+    no_ret_no_args();
 
     let no_ret_one_arg = compile_fn!((a: u32), {
                                let mut x = a; for i in 0..10 { x += i; }
                            }).expect("compile error");
-    (no_ret_one_arg.func)(5);
+    no_ret_one_arg(5);
 
     let no_args = compile_fn!(() -> u32, {
                                let mut x = 0; for i in 0..10 { x += i; } x
                            }).expect("compile error");
-    assert_eq!((no_args.func)(), 45);
+    assert_eq!(no_args(), 45);
 
     let one_arg = compile_fn!((a: u32) -> u32, {
                                let mut x = a; for i in 0..10 { x += i; } x
                            }).expect("compile error");
-    assert_eq!((one_arg.func)(5), 50);
+    assert_eq!(one_arg(5), 50);
 
     let two_args = compile_fn!((a: u32, b: u32) -> u32, {
                                let mut x = a; for i in 0..10 { x += i * b; } x
                            }).expect("compile error");
-    assert_eq!((two_args.func)(5, 1), 50);
+    assert_eq!(two_args(5, 1), 50);
 }
