@@ -1,7 +1,10 @@
 [package]
-name = "eval"
+name = "defmacro"
 version = "0.1.0"
 authors = ["Kent Overstreet <kent.overstreet@gmail.com>"]
 
 [dependencies]
 tempdir = "0.3"
+
+[lib]
+plugin = true

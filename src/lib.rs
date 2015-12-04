@@ -1,7 +1,5 @@
-#![feature(core)]
-#![feature(dynamic_lib)]
-#![feature(unboxed_closures)]
-#![feature(log_syntax)]
+#![crate_type="dylib"]
+#![feature(dynamic_lib, unboxed_closures, plugin_registrar, rustc_private, slice_patterns, convert)]
 
 use std::fs::File;
 use std::io;
@@ -26,6 +24,15 @@ impl From<String> for EvalError {
     }
 }
 
+impl<'a> AsRef<str> for EvalError {
+    fn as_ref(&self) -> &str {
+        match self {
+            &EvalError::CompileError(ref s) => s.as_str(),
+            &EvalError::InternalError   => "internal error",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum EvalError {
     CompileError(String),
@@ -33,14 +40,15 @@ pub enum EvalError {
 }
 
 #[allow(deprecated)]
-pub unsafe fn __compile_fn(fn_type: &str, src: &str)
+pub unsafe fn __compile_fn(environment: &str, fn_type: &str, src: &str)
             -> Result<(DynamicLibrary, *mut usize), EvalError> {
     let tempdir = try!(TempDir::new("rust-eval"));
     let srcpath = tempdir.path().join("eval.rs");
 
     let mut srcfile = try!(File::create(&srcpath));
 
-    try!(srcfile.write(b"#[no_mangle]\n"));
+    try!(srcfile.write(environment.as_bytes()));
+    try!(srcfile.write(b"\n#[no_mangle]\n"));
     try!(srcfile.write(b"pub fn func "));
     try!(srcfile.write(fn_type.as_bytes()));
     try!(srcfile.write(b" { "));
@@ -67,7 +75,7 @@ pub unsafe fn __compile_fn(fn_type: &str, src: &str)
 }
 
 macro_rules! compile_fn_str {
-    (($($A:ident : $T:ty),*) -> $R:ty, $src:expr) => { unsafe {
+    ($environment:expr, ($($A:ident : $T:ty),*) -> $R:ty, $src:expr) => { unsafe {
         use std::mem::transmute;
         struct CompiledFn {
             /* need the DynamicLibrary handle to live as long as the fn pointer.. */
@@ -76,6 +84,7 @@ macro_rules! compile_fn_str {
             func: fn($($A: $T),*) -> $R,
         }
 
+        /*
         impl Fn<($($T,)*)> for CompiledFn {
             #[inline]
             extern "rust-call" fn call(&self, ($($A,)*): ($($T,)*)) -> $R {
@@ -98,19 +107,20 @@ macro_rules! compile_fn_str {
                 (self.func)($($A),*)
             }
         }
+        */
 
-        __compile_fn(stringify!(($($A: $T),*) -> $R), $src)
+        __compile_fn($environment, stringify!(($($A: $T),*) -> $R), $src)
             .map(|x| { let (l, f) = x; CompiledFn { lib: l, func: transmute(f)} } )
     } };
 
-    (($($A:ident : $T:ty),*), $src:expr)  => {
+    ($environment:expr, ($($A:ident : $T:ty),*), $src:expr)  => {
         compile_fn_str!(($($A: $T),*) -> (), $src)
     };
 }
 
 macro_rules! compile_fn {
     (($($A:ident : $T:ty),*) -> $R:ty, $src:expr)  => {
-        compile_fn_str!(($($A: $T),*) -> $R, stringify!($src))
+        compile_fn_str!("", ($($A: $T),*) -> $R, stringify!($src))
     };
 
     (($($A:ident : $T:ty),*), $src:expr)  => {
@@ -120,7 +130,7 @@ macro_rules! compile_fn {
 
 macro_rules! eval_str {
     ($R:ty, $src:expr) => {
-        compile_fn_str!(() -> $R, $src).map(|f| f())
+        compile_fn_str!("", () -> $R, $src).map(|f| f())
     };
 }
 
@@ -130,6 +140,7 @@ macro_rules! eval {
 
 #[test]
 fn test_eval() {
+    /*
     assert_eq!(eval_str!(u32, "0u32"), Ok(0));
     assert_eq!(eval_str!(u32, "let mut x = 0; for i in 0..10 { x += i; } x"), Ok(45));
 
@@ -160,4 +171,84 @@ fn test_eval() {
                                let mut x = a; for i in 0..10 { x += i * b; } x
                            }).expect("compile error");
     assert_eq!(two_args(5, 1), 50);
+    */
+}
+
+extern crate syntax;
+extern crate rustc;
+
+use syntax::codemap::Span;
+use syntax::parse::token;
+use syntax::ast::TokenTree;
+use syntax::ast::TokenTree::Token;
+use syntax::ext::base::{ExtCtxt, MacResult, DummyResult, NormalTT, TTMacroExpander};
+use syntax::print::pprust;
+use rustc::plugin::Registry;
+
+struct DefmacroFunc {
+    #[allow(dead_code, deprecated)]
+    lib: DynamicLibrary,
+    func: fn(cx: &mut syntax::ext::base::ExtCtxt,
+             sp: syntax::codemap::Span,
+             tt: &[syntax::ast::TokenTree])
+        -> Box<syntax::ext::base::MacResult + 'static>,
+}
+
+impl TTMacroExpander for DefmacroFunc {
+    fn expand<'cx>(&self,
+                   cx: &'cx mut ExtCtxt,
+                   sp: Span,
+                   tt: &[TokenTree])
+        -> Box<MacResult+'cx> {
+        (self.func)(cx, sp, tt)
+    }
+}
+
+fn expand_defmacro(cx: &mut ExtCtxt, sp: Span, args: &[TokenTree])
+        -> Box<MacResult + 'static> {
+    let (name, body) = match args {
+        [Token(_, token::Ident(name, _)),
+         Token(_, token::Comma),
+        ref body] => (name, body),
+        _ => {
+            println!("got {} tokens", args.len());
+            cx.span_err(sp, "bad arguments");
+            return DummyResult::any(sp);
+        }
+    };
+
+    let environment = "
+    #![feature(rustc_private)]
+    #![feature(slice_patterns)]
+    extern crate syntax;
+    extern crate rustc;
+    ";
+
+    let new_macro = match compile_fn_str!(environment,
+                                  (cx: &mut syntax::ext::base::ExtCtxt,
+                                   sp: syntax::codemap::Span,
+                                   args: &[syntax::ast::TokenTree])
+                                        -> Box<syntax::ext::base::MacResult + 'static>,
+                                  &pprust::tt_to_string(&body)) {
+        Ok(m)   => m,
+        Err(e)  => {
+            cx.span_err(sp, e.as_ref());
+            return DummyResult::any(sp);
+        }
+    };
+
+    let new_macro_t = unsafe { DefmacroFunc {
+        lib: new_macro.lib,
+        func: std::mem::transmute(new_macro.func),
+    }};
+
+    //cx.exported_macros.push(body);
+    cx.syntax_env.insert(name.name, NormalTT(Box::new(new_macro_t), None, false));
+
+    DummyResult::any(sp)
+}
+
+#[plugin_registrar]
+pub fn plugin_registrar(reg: &mut Registry) {
+    reg.register_macro("defmacro", expand_defmacro);
 }
